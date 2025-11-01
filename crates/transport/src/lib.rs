@@ -23,6 +23,7 @@ pub async fn run_sender_from_channel(
     host: &str,
     rekey_every: Option<Duration>,
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
+    metrics_opt: Option<metrics::Metrics>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use rand::RngCore;
@@ -30,10 +31,39 @@ pub async fn run_sender_from_channel(
     let mut sock = tokio::net::TcpStream::connect(host).await.context("connect")?;
     eprintln!("[send] connected to {host}");
 
-    let (mut tx, _rx_unused, shared32) = handshake_client(&mut sock).await.context("handshake_client")?;
+    let hs_start = Instant::now();
+    let (mut tx, _rx_unused, shared32, client_pub_len, server_pub_len) = match handshake_client(&mut sock).await.context("handshake_client") {
+        Ok(v) => v,
+        Err(e) => {
+            // no metrics instance available, just return error
+            return Err(e);
+        }
+    };
+    let hs_d = hs_start.elapsed();
     eprintln!("[send] handshake OK");
+    // record handshake if metrics provided via global app wiring
+    if let Some(m) = &metrics_opt {
+        let bytes_sent = (2 + client_pub_len + 8) as u64;
+        let bytes_received = (2 + server_pub_len + 8) as u64;
+        let _ = m.record_handshake("ECDH", hs_d, bytes_sent, bytes_received, true, None);
+    }
     let mut next_rekey_at = rekey_every.map(|d| Instant::now() + d);
     let mut seq: u32 = 0;
+    // throughput counters
+    let mut throughput_bytes: u64 = 0;
+    let mut throughput_frames: u64 = 0;
+    let mut throughput_last = Instant::now();
+
+    // spawn periodic system snapshot and latency summary if metrics requested
+    if let Some(m) = metrics_opt.clone() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = m.record_system_snapshot();
+                let _ = m.write_latency_summary();
+            }
+        });
+    }
 
     loop {
         // handle timer first (if set), else wait for a frame
@@ -46,11 +76,19 @@ pub async fn run_sender_from_channel(
                     rand::rngs::OsRng.fill_bytes(&mut c2s);
                     rand::rngs::OsRng.fill_bytes(&mut s2c);
                     let mut pt=[0u8;REKEY_PT_LEN]; pt[0..16].copy_from_slice(&salt); pt[16..24].copy_from_slice(&c2s); pt[24..32].copy_from_slice(&s2c);
+                    // measure full rekey send time (rng, encrypt, write, rotate)
+                    let rekey_start = Instant::now();
                     let ct = tx.encrypt(REKEY_SEQ, &pt, &aad(REKEY_SEQ))?;
                     let mut hdr=[0u8;12]; hdr[..8].copy_from_slice(&(REKEY_SEQ as u64).to_be_bytes()); hdr[8..12].copy_from_slice(&(u32::try_from(ct.len()).unwrap()).to_be_bytes());
                     sock.write_all(&hdr).await?; sock.write_all(&ct).await?;
                     // rotate local sender key/base
                     let (k_c2s,_)=hkdf_pair_from_shared(&shared32,&salt); tx = aead::AesGcmCtx::new(k_c2s,c2s);
+                    // record rekey event in metrics (if present) with measured total rekey duration
+                    if let Some(m) = &metrics_opt {
+                        let bytes_sent = (12 + ct.len()) as u64; // hdr + ct
+                        let rekey_d = rekey_start.elapsed();
+                        let _ = m.record_handshake("REKEY", rekey_d, bytes_sent, 0, true, None);
+                    }
                     seq=0; eprintln!("[send] rekey sent+applied");
                     next_rekey_at = rekey_every.map(|d| Instant::now() + d);
                 }
@@ -63,6 +101,20 @@ pub async fn run_sender_from_channel(
                     let ct = tx.encrypt(seq, &pt, &aad(seq))?;
                     let mut hdr=[0u8;12]; hdr[..8].copy_from_slice(&(seq as u64).to_be_bytes()); hdr[8..12].copy_from_slice(&(u32::try_from(ct.len()).unwrap()).to_be_bytes());
                     sock.write_all(&hdr).await?; sock.write_all(&ct).await?;
+                    // throughput accounting
+                    throughput_frames += 1;
+                    throughput_bytes += (ct.len() + 12) as u64;
+                    if let Some(m) = &metrics_opt {
+                        let now = Instant::now();
+                        let dur = now.duration_since(throughput_last).as_secs_f64();
+                        if dur >= 5.0 {
+                            let goodput_mbps = (throughput_bytes as f64 * 8.0) / (dur * 1e6);
+                            let _ = m.record_throughput(dur, goodput_mbps, throughput_frames);
+                            throughput_last = now;
+                            throughput_bytes = 0;
+                            throughput_frames = 0;
+                        }
+                    }
                     seq = seq.wrapping_add(1);
                 }
             }
@@ -76,6 +128,19 @@ pub async fn run_sender_from_channel(
             let ct = tx.encrypt(seq, &pt, &aad(seq))?;
             let mut hdr=[0u8;12]; hdr[..8].copy_from_slice(&(seq as u64).to_be_bytes()); hdr[8..12].copy_from_slice(&(u32::try_from(ct.len()).unwrap()).to_be_bytes());
             sock.write_all(&hdr).await?; sock.write_all(&ct).await?;
+            throughput_frames += 1;
+            throughput_bytes += (ct.len() + 12) as u64;
+            if let Some(m) = &metrics_opt {
+                let now = Instant::now();
+                let dur = now.duration_since(throughput_last).as_secs_f64();
+                if dur >= 5.0 {
+                    let goodput_mbps = (throughput_bytes as f64 * 8.0) / (dur * 1e6);
+                    let _ = m.record_throughput(dur, goodput_mbps, throughput_frames);
+                    throughput_last = now;
+                    throughput_bytes = 0;
+                    throughput_frames = 0;
+                }
+            }
             seq = seq.wrapping_add(1);
         }
     }
@@ -87,6 +152,7 @@ pub async fn run_sender_from_channel(
 pub async fn run_receiver_to_channel(
     bind: &str,
     frame_tx: mpsc::Sender<Vec<u8>>,
+    metrics_opt: Option<metrics::Metrics>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     let listener = tokio::net::TcpListener::bind(bind).await.context("bind")?;
@@ -94,8 +160,39 @@ pub async fn run_receiver_to_channel(
     let (mut sock, peer) = listener.accept().await.context("accept")?;
     eprintln!("[recv] connection from {peer}");
 
-    let (_tx_unused, mut rx, shared32) = handshake_server(&mut sock).await.context("handshake_server")?;
+    let hs_start = Instant::now();
+    let (mut _tx_unused, mut rx, shared32, client_pub_len, server_pub_len) = match handshake_server(&mut sock).await.context("handshake_server") {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(m) = &metrics_opt {
+                let _ = m.record_handshake("ECDH", hs_start.elapsed(), 0, 0, false, Some(format!("{e}")));
+            }
+            return Err(e);
+        }
+    };
+    let hs_d = hs_start.elapsed();
     eprintln!("[recv] handshake OK");
+    if let Some(m) = &metrics_opt {
+        let bytes_sent = (2 + server_pub_len + 8) as u64;
+        let bytes_received = (2 + client_pub_len + 8) as u64;
+        let _ = m.record_handshake("ECDH", hs_d, bytes_sent, bytes_received, true, None);
+    }
+
+    // spawn periodic system snapshot and latency summary if requested
+    if let Some(m) = metrics_opt.clone() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = m.record_system_snapshot();
+                let _ = m.write_latency_summary();
+            }
+        });
+    }
+
+        // throughput counters
+        let mut throughput_bytes: u64 = 0;
+        let mut throughput_frames: u64 = 0;
+        let mut throughput_last = Instant::now();
 
     loop {
         let mut hdr=[0u8;12];
@@ -104,19 +201,66 @@ pub async fn run_receiver_to_channel(
         let ct_len = u32::from_be_bytes(hdr[8..12].try_into().unwrap()) as usize;
         let mut ct = vec![0u8; ct_len];
         sock.read_exact(&mut ct).await?;
-        let pt = rx.decrypt(seq, &ct, &aad(seq))?;
+        // measure rekey handling time for rekey control frames (decrypt + hkdf + rotate)
+        let handling_start = Instant::now();
+        let pt = match rx.decrypt(seq, &ct, &aad(seq)) {
+            Ok(p) => { p }
+            Err(e) => {
+                eprintln!("[recv] decrypt error: {e}");
+                if let Some(m) = &metrics_opt {
+                    let _ = m.record_errors(0, 1, 0);
+                }
+                continue;
+            }
+        };
 
         if seq == REKEY_SEQ {
             if pt.len()!=REKEY_PT_LEN { anyhow::bail!("bad rekey payload length"); }
+            // extract fields
             let mut salt=[0u8;16]; salt.copy_from_slice(&pt[0..16]);
             let mut c2s=[0u8;8];   c2s.copy_from_slice(&pt[16..24]);
-            let (k_c2s,_)=hkdf_pair_from_shared(&shared32,&salt);
-            rx = aead::AesGcmCtx::new(k_c2s, c2s);
+            let mut s2c=[0u8;8];   s2c.copy_from_slice(&pt[24..32]);
+
+            // Server role: new RX is k_c2s with c2s_base
+            let (k_c2s, _k_s2c) = hkdf_pair_from_shared(&shared32, &salt);
+            rx = AesGcmCtx::new(k_c2s, c2s);
+
+            // record total handling duration for REKEY
+            if let Some(m) = &metrics_opt {
+                let bytes_received = (12 + ct.len()) as u64; // header + ciphertext
+                let handling_d = handling_start.elapsed();
+                let _ = m.record_handshake("REKEY", handling_d, 0, bytes_received, true, None);
+            }
             eprintln!("[recv] rekey applied");
-            continue;
+            // do NOT continue; allow loop to keep running and log every event
         }
 
-        // normal data frame: strip 8B timestamp and forward H.264 AU
+        // normal data frame: compute latency from 8B timestamp, strip it and forward H.264 AU
+        if pt.len() >= 8 {
+            let mut tsb = [0u8;8]; tsb.copy_from_slice(&pt[0..8]);
+            let sender_ns = u64::from_be_bytes(tsb);
+            let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+            if now_ns >= sender_ns {
+                let latency_ms = (now_ns - sender_ns) as f64 / 1e6;
+                if let Some(m) = &metrics_opt {
+                    let _ = m.record_frame_latency_ms(latency_ms);
+                }
+            }
+            // throughput accounting
+            throughput_frames += 1;
+            throughput_bytes += (ct.len() + 12) as u64;
+            if let Some(m) = &metrics_opt {
+                let now = Instant::now();
+                let dur = now.duration_since(throughput_last).as_secs_f64();
+                if dur >= 5.0 {
+                    let goodput_mbps = (throughput_bytes as f64 * 8.0) / (dur * 1e6);
+                    let _ = m.record_throughput(dur, goodput_mbps, throughput_frames);
+                    throughput_last = now;
+                    throughput_bytes = 0;
+                    throughput_frames = 0;
+                }
+            }
+        }
         let h264 = if pt.len()>=8 { pt[8..].to_vec() } else { Vec::new() };
         if frame_tx.send(h264).await.is_err() { break; }
     }
@@ -154,7 +298,7 @@ async fn write_all(stream: &mut TcpStream, buf: &[u8]) -> Result<()> {
 }
 
 
-async fn handshake_client(stream: &mut TcpStream) -> Result<(AesGcmCtx, AesGcmCtx, [u8; 32])> {
+async fn handshake_client(stream: &mut TcpStream) -> Result<(AesGcmCtx, AesGcmCtx, [u8; 32], usize, usize)> {
    // Generate client ECDH
    let client_secret = EphemeralSecret::random(&mut rand::rngs::OsRng);
    let client_pub = PublicKey::from(&client_secret);
@@ -198,13 +342,13 @@ async fn handshake_client(stream: &mut TcpStream) -> Result<(AesGcmCtx, AesGcmCt
    read_exact(stream, &mut server_base).await?;
 
 
-   let tx = AesGcmCtx::new(k_c2s, client_base); // client -> server
-   let rx = AesGcmCtx::new(k_s2c, server_base); // server -> client
-   Ok((tx, rx, shared32))
+    let tx = AesGcmCtx::new(k_c2s, client_base); // client -> server
+    let rx = AesGcmCtx::new(k_s2c, server_base); // server -> client
+    Ok((tx, rx, shared32, client_pub_bytes.len(), server_pub_bytes.len()))
 }
 
 
-async fn handshake_server(stream: &mut TcpStream) -> Result<(AesGcmCtx, AesGcmCtx, [u8; 32])> {
+async fn handshake_server(stream: &mut TcpStream) -> Result<(AesGcmCtx, AesGcmCtx, [u8; 32], usize, usize)> {
    // Read client pub
    let mut lbuf = [0u8; 2];
    read_exact(stream, &mut lbuf).await?;
@@ -242,9 +386,9 @@ async fn handshake_server(stream: &mut TcpStream) -> Result<(AesGcmCtx, AesGcmCt
    write_all(stream, &server_base).await?;
 
 
-   let tx = AesGcmCtx::new(k_s2c, server_base); // server -> client
-   let rx = AesGcmCtx::new(k_c2s, client_base); // client -> server
-   Ok((tx, rx, shared32))
+    let tx = AesGcmCtx::new(k_s2c, server_base); // server -> client
+    let rx = AesGcmCtx::new(k_c2s, client_base); // client -> server
+    Ok((tx, rx, shared32, client_pub_bytes.len(), server_pub_bytes.len()))
 }
 
 
@@ -259,7 +403,7 @@ pub async fn run_receiver(bind: &str) -> Result<()> {
    eprintln!("[recv] connection from {peer}");
 
 
-   let (_tx_unused, mut rx, shared32) = handshake_server(&mut sock).await.context("handshake_server")?;
+    let (_tx_unused, mut rx, shared32, _client_pub_len, _server_pub_len) = handshake_server(&mut sock).await.context("handshake_server")?;
    eprintln!("[recv] handshake OK");
 
 
@@ -321,7 +465,7 @@ pub async fn run_sender(host: &str, n_frames: u32, rekey_every: Option<Duration>
 
 
    // Handshake must return (tx, rx, shared32). We only use tx + shared32 here.
-   let (mut tx, _rx_unused, shared32) = handshake_client(&mut sock).await.context("handshake_client")?;
+    let (mut tx, _rx_unused, shared32, _client_pub_len, _server_pub_len) = handshake_client(&mut sock).await.context("handshake_client")?;
    eprintln!("[send] handshake OK");
 
 
@@ -413,8 +557,3 @@ pub async fn run_sender(host: &str, n_frames: u32, rekey_every: Option<Duration>
    eprintln!("[send] done");
    Ok(())
 }
-
-
-
-
-

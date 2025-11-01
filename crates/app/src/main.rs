@@ -60,16 +60,27 @@ async fn main() {
     }
 
 // Receiver
-if has_flag(&args, "--mode=receiver") {
+    if has_flag(&args, "--mode=receiver") {
     log_arm_crypto_support();
+        // optional metrics directory
+        let metrics_dir = arg_val(&args, "--metrics-dir");
+        let metrics = metrics_dir.as_ref().and_then(|d| {
+            match metrics::Metrics::new(d) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("warning: could not create metrics at {d}: {e}");
+                    None
+                }
+            }
+        });
     let bind    = arg_val(&args, "--bind").unwrap_or_else(|| "127.0.0.1:5000".to_string());
     let payload = arg_val(&args, "--payload").unwrap_or_else(|| "bytes".to_string());
     eprintln!("[app] mode=receiver payload={payload}");
 
-    if payload == "video" {
+        if payload == "video" {
         let fps = arg_val(&args, "--fps").and_then(|s| s.parse::<i32>().ok()).unwrap_or(30);
         let (tx, _pipe) = video::start_h264_playback(fps).expect("gst playback");
-        if let Err(e) = transport::run_receiver_to_channel(&bind, tx).await {
+            if let Err(e) = transport::run_receiver_to_channel(&bind, tx, metrics.clone()).await {
             eprintln!("receiver error: {e}");
             std::process::exit(1);
         }
@@ -84,8 +95,16 @@ if has_flag(&args, "--mode=receiver") {
 
 // Sender
 // ----- sender branch -----
-if has_flag(&args, "--mode=sender") {
+    if has_flag(&args, "--mode=sender") {
     log_arm_crypto_support();
+
+        let metrics_dir = arg_val(&args, "--metrics-dir");
+        let metrics = metrics_dir.as_ref().and_then(|d| {
+            match metrics::Metrics::new(d) {
+                Ok(m) => Some(m),
+                Err(e) => { eprintln!("warning: could not create metrics at {d}: {e}"); None }
+            }
+        });
 
     let host   = arg_val(&args, "--host").unwrap_or_else(|| "127.0.0.1:5000".to_string());
     let _n     = arg_val(&args, "--frames").and_then(|s| s.parse::<u32>().ok()).unwrap_or(300);
@@ -94,7 +113,7 @@ if has_flag(&args, "--mode=sender") {
 
     eprintln!("[app] mode=sender payload={payload} rekey={rekey:?}");
 
-    if payload == "video" {
+        if payload == "video" {
         let dev = arg_val(&args, "--device").unwrap_or_else(|| "/dev/video0".to_string());
         let w   = arg_val(&args, "--width").and_then(|s| s.parse::<i32>().ok()).unwrap_or(1280);
         let h   = arg_val(&args, "--height").and_then(|s| s.parse::<i32>().ok()).unwrap_or(720);
@@ -115,7 +134,7 @@ if has_flag(&args, "--mode=sender") {
             }
         };
 
-        if let Err(e) = transport::run_sender_from_channel(&host, rekey, rx).await {
+        if let Err(e) = transport::run_sender_from_channel(&host, rekey, rx, metrics.clone()).await {
             eprintln!("sender error: {e}");
             std::process::exit(1);
         }
