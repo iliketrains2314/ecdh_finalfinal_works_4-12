@@ -201,6 +201,12 @@ impl Metrics {
     /// Record a single per-frame latency sample in milliseconds.
     /// The project should stamp frames with the sender timestamp (UTC or monotonic) before encryption.
     pub fn record_frame_latency_ms(&self, latency_ms: f64) -> Result<()> {
+        // Filter out implausible samples (negative, NaN/Inf, or extremely large)
+        if !latency_ms.is_finite() || latency_ms < 0.0 || latency_ms > 10_000.0 {
+            // ignore outlier
+            return Ok(());
+        }
+
         {
             let mut lat = self.latencies_ms.lock().unwrap();
             lat.push(latency_ms);
@@ -242,6 +248,13 @@ impl Metrics {
         let mut w = self.latency_w.lock().unwrap();
         w.serialize(rec)?;
         w.flush()?;
+
+        // Clear samples so future summaries are per-interval and not cumulative
+        {
+            let mut lat_guard = self.latencies_ms.lock().unwrap();
+            lat_guard.clear();
+        }
+
         Ok(())
     }
 
